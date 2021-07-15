@@ -1,6 +1,6 @@
-import { serve, ServerRequest } from "https://deno.land/std@0.101.0/http/server.ts";
+import { serve, ServerRequest, readAll } from "./deps.ts";
 
-async function callDocker(path: string, payload: object): Promise<object> {
+async function callDocker(path: string, payload: object, json: boolean = true): Promise<object> {
 	const response = await fetch(`http://localhost:4444/v1.41/${path}`, {
 		method: "POST",
 		headers: {
@@ -10,7 +10,11 @@ async function callDocker(path: string, payload: object): Promise<object> {
 		body: JSON.stringify(payload)
 	});
 
-	return await response.json();
+	if(json === true) {
+		return await response.json();
+	} else {
+		return await response.arrayBuffer();
+	}
 }
 
 interface Image {
@@ -19,11 +23,11 @@ interface Image {
 	org: string;
 }
 
-function imageToString(image: Image) {
+function imageToString(image: Image): string {
 	return `${image.org}/${image.repo}:${image.tag}`;
 }
 
-const portMap = {};
+const portMap: { [key: string]: Promise<number>; } = {};
 
 function parseHost(host: string): Image {
 	const [ tag, repo, org ] = host.split(".");
@@ -32,31 +36,37 @@ function parseHost(host: string): Image {
 }
 
 async function pullImage(image: Image) {
-	await callDocker(`images/create?fromImage=${imageToString(image)}`, {});
+	await callDocker(`images/create?fromImage=${imageToString(image)}`, {}, false);
 }
 
-async function createContainer(image: Image): string {
-	const port = 5000 + Math.floor(Math.random() * 1000);
+async function createContainer(image: Image, port: number): Promise<string> {
+	interface createContainerResponse {
+		Id: string;
+	}
 
-	portMap[imageToString] = port;
-
-	await callDocker("containers/create", {
+	const response: createContainerResponse = await callDocker("containers/create", {
 		Image: `${image.org}/${image.repo}:${image.tag}`,
-		PortBindings: {
-			"80/tcp": {
-				HostPort: port
+		HostConfig: {
+			PortBindings: {
+				"80/tcp": [
+					{ HostPort: port.toString() }
+				]
 			}
 		}
-	});
+	}) as createContainerResponse;
+
+	if(typeof response.Id !== "string") {
+		throw new Error("failed to create container, responded with no `ID`");
+	}
+
+	return response.Id;
 }
 
-async function startContainer(container: string) {
-	await callDocker(`containers/${container}/start`);
+async function startContainer(container: string): Promise<void> {
+	await callDocker(`containers/${container}/start`, {}, false);
 }
 
-async function handleRequest(request: ServerRequest) {
-	console.log(request);
-
+async function ensureContainerRunning(request: ServerRequest): Promise<void> {
 	const host = request.headers.get("host");
 
 	if(typeof host !== "string") {
@@ -65,14 +75,74 @@ async function handleRequest(request: ServerRequest) {
 
 	const image = parseHost(host);
 
-	console.log({ image });
+	if(!(portMap[imageToString(image)] instanceof Promise)) {
+		portMap[imageToString(image)] = (async () => {
+			const port = 5000 + Math.floor(Math.random() * 1000);
 
-	if(typeof portMap[imageToString(image)] !== "number") {
-		const id = await createContainer(image);
-		await startContainer(id);
+			await pullImage(image);
+			
+			const id = await createContainer(image, port);
+			console.log({ id });
+			
+			await startContainer(id);
 
-		console.log("container started");
+			console.log("container started");
+
+			await new Promise(r => setTimeout(r, 500));
+
+			return port;
+		})() as Promise<number>;
 	}
+}
+
+async function proxyRequest(request: ServerRequest): Promise<void> {
+	const host = request.headers.get("host");
+
+	if(typeof host !== "string") {
+		throw new Error("host cannot be undefined");
+	}
+
+	const port = await portMap[imageToString(parseHost(host))];
+	
+	const url = `http://127.0.0.1:${port}${request.url}`;
+
+	console.log(request.headers);
+
+	const res = await fetch(url, {
+		method: request.method,
+		headers: request.headers,
+		body: !([ "GET", "HEAD" ].includes(request.method)) ? await readAll(request.body) : null
+	});
+
+	const body = new Uint8Array(await res.arrayBuffer());
+
+	const responseHeaders = new Headers();
+
+	console.log({
+		resHeaders: res.headers
+	})
+
+	// copy specified headers from fetch response to server response
+	for(const header of [
+		"Set-Cookie",
+		"Content-Type"
+	]) {
+		if(res.headers.has(header)) {
+			const value = res.headers.get(header) as string;
+		
+			responseHeaders.append(header, value);
+		}
+	}
+
+	request.respond({
+		body,
+		headers: responseHeaders
+	});
+}
+
+async function handleRequest(request: ServerRequest): Promise<void> {
+	await ensureContainerRunning(request);
+	await proxyRequest(request);
 }
 
 const server = serve({ port: 3000 });

@@ -1,2 +1,2 @@
 #!/bin/sh
-socat -v tcp-l:4444,reuseaddr,fork unix:/var/run/docker.sock
+socat -v tcp-l:4444,reuseaddr,fork  UNIX-CONNECT:/var/run/docker.sock

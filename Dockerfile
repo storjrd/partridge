@@ -7,10 +7,12 @@ EXPOSE 3000
 
 WORKDIR /app
 
-COPY main.ts .
-RUN deno cache main.ts
+COPY deps.ts .
+RUN deno cache deps.ts
 
 ADD . .
+
+RUN deno cache main.ts
 
 USER root
 
